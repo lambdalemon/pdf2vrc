@@ -204,7 +204,15 @@ def min_pot_rect_greater(n):
     log2size = (n - 1).bit_length()
     return 1 << (log2size // 2), 1 << (log2size - log2size // 2)
 
-def encode_pdf_tex(pages, glyph_indexer, atlas_bounds):
+def page_offset_float32(offset, m):
+    return offset, *m[1:]
+
+def page_offset_float16(offset, m):
+    high, low = offset >> 14, offset & 0x3FFF # avoid NaNs
+    buf_uint16 = np.array((high, *m[1:3], low), dtype=np.uint16)
+    return np.frombuffer(buf_uint16, dtype=np.float16)
+
+def encode_pdf_tex(pages, glyph_indexer, atlas_bounds, dtype):
     data = [get_page_data(p, glyph_indexer) for p in pages]
     meta = [d[0] for d in data]
     max_num_quads = max(sum(m[1:]) for m in meta)
@@ -213,22 +221,22 @@ def encode_pdf_tex(pages, glyph_indexer, atlas_bounds):
     print(f'# of triangles required: {(max_num_quads - 1) // 32 + 1}')
     if atlas_bounds:
         print(f'Atlas Offset: {len(atlas_bounds)}')
-    sizes = [len(data) + len(atlas_bounds)]
-    sizes.extend(m[0] for m in meta)
+    offsets = accumulate((m[0] for m in meta), initial = len(data) + len(atlas_bounds))
+    page_offset_f = page_offset_float16 if dtype == np.float16 else page_offset_float32
     final = list(chain(atlas_bounds,
-                       ((offset,) + m[1:] for offset, m in zip(accumulate(sizes), meta)),
+                       map(page_offset_f, offsets, meta),
                        (x for d in data for x in d[1])))
 
     height, width = min_pot_rect_greater(len(final))
-    tex = np.array(final)
+    tex = np.array(final, dtype=dtype)
     tex.resize(height, width, 4)
     tex = tex[::-1]
-    return tex
+    return np.ascontiguousarray(tex)
 
 def write_exr_texture(tex, filename):
-    channels = { "RGBA" : tex.astype('f') }
+    channels = { "RGBA" : tex }
     header = { "compression" : OpenEXR.ZIP_COMPRESSION,
-            "type" : OpenEXR.scanlineimage }
+               "type" : OpenEXR.scanlineimage }
     with OpenEXR.File(header, channels) as outfile:
         outfile.write(filename)
     print(f"Encoded pdf in {filename}.")
@@ -302,11 +310,12 @@ if __name__ == "__main__":
     parser.add_argument("--unicode-all", help="extract all fonts by unicode", action="store_true")
     parser.add_argument("--packed", help="generate a tightly packed atlas. recommended for math papers/books since these tend to have large variance between glyph sizes, and a large amount of atlas space will be otherwise wasted", action="store_true")
     parser.add_argument("--atlas-size", help="specify atlas size. if the default size is not large enough. PLEASE USE A POWER OF TWO LIKE 1024, 2048, 4096", type=int)
+    parser.add_argument("--half", help="encode pdf as RGBA Half, which reduces texture memory usage", action="store_true")
     parser.add_argument("--do-not-regen-atlas", help="for testing purpose only", action="store_true")
 
     args = parser.parse_args()
     pages = list(extract_pages(Path(args.filename)))
-    outname = args.filename[:-4] + ("_packed" if args.packed else "")
+    outname = args.filename[:-4] + ("_packed" if args.packed else "") + ("_half" if args.half else "")
     by_unicode_fonts = EVERYTHING if args.unicode_all else set(args.unicode) if args.unicode else set()
 
     Path.mkdir(Path("fonts"), exist_ok=True)
@@ -324,7 +333,8 @@ if __name__ == "__main__":
 
     atlas_bounds = run_atlas_gen(outname, indexer, font_filepaths, args.packed, args.atlas_size, args.do_not_regen_atlas)
 
-    tex = encode_pdf_tex(pages, indexer, atlas_bounds)
+    dtype = np.float16 if args.half else np.float32
+    tex = encode_pdf_tex(pages, indexer, atlas_bounds, dtype)
     write_exr_texture(tex, f"out\\{outname}.exr")
 
 
