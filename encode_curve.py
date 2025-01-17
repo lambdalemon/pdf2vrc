@@ -1,5 +1,6 @@
 from typing import Iterable
-from itertools import product, combinations, pairwise, accumulate, cycle
+from itertools import product, combinations, pairwise, accumulate, cycle, chain
+import re
 import numpy as np
 from numpy.linalg import norm
 from pdfminer.layout import LTLine
@@ -40,7 +41,7 @@ def split_bezier(x0, x1, x2):
     mid = (c0 + c1) / 2    
     return c0, mid, c1
 
-def is_black(c, cutoff=1e-2):
+def is_black(c, cutoff=1e-1):
     if isinstance(c, Iterable):
         return len(c) == 3 and sum(c) < 3 * cutoff or len(c) == 4 and c[-1] > 1 - cutoff
     else:
@@ -59,8 +60,7 @@ def bounding_box(verts):
     center = (max_xy[best] + min_xy[best]) / 2
     halfsize = size_xy[best] / 2
     box = (center + halfsize * 1.1 * np.array([(-1, -1), (-1, 1), (1, 1), (1, -1)])).dot(rots[best])
-    ext_pt = (center + halfsize * 1.05 * np.array((-1, -1))).dot(rots[best])
-    return box, ext_pt
+    return box
 
 def tri_uv_packed(a,b,c):
     return -((1+a) + ((1+b)<<2) + ((1+c)<<4))
@@ -157,14 +157,11 @@ def encode_spline(spline, dashing_style, linewidth, rescale):
         return data
 
 
-def encode_curve(o, rescale):
-    if isinstance(o, LTLine):
-        return encode_line(o, rescale)
-
-    verts = [np.array(o.original_path[0][1])]
+def parse_subpath(path, always_close):
+    verts = [np.array(path[0][1])]
     segments = []
     beziers = {}
-    for t, *xs in o.original_path[1:]:
+    for t, *xs in path[1:]:
         index = len(verts)-1
         if t == 'h':
             if norm(verts[0] - verts[-1]) > 1e-4:
@@ -201,166 +198,190 @@ def encode_curve(o, rescale):
         if (index-2, index) in beziers:
             beziers[(index-2, 0)] = beziers[(index-2, index)]
             del beziers[(index-2, index)]
-    elif o.fill and t != 'h':
+    elif always_close and t != 'h':
         segments.append((index, 0))
 
-    verts = np.array(verts)
+    return np.array(verts), segments, beziers
+
+# For fill we follow this paper, but with quadratic beziers only
+# https://www.microsoft.com/en-us/research/wp-content/uploads/2005/01/p1000-loop.pdf
+def encode_curve_fill(verts, segments, beziers, rescale, evenodd):
+    data = []
+
+    def is_intersecting(s, t):
+        return not (set(s) & set(t)) and segment_intersect(*verts[list(s+t)]) 
+
+    if any(is_intersecting(s,t) for s,t in combinations(set(segments) - set(beziers), 2)):
+        return None
+
+    def tri_segments(s):
+        return combinations(s + (beziers[s],), 2) if s in beziers else [s]
+
+    removed_vs = set()
+    for _ in range(5):
+        segments.sort(key=lambda s: -norm(verts[s[0]]-verts[s[1]]) if s in beziers else 1)
+        replaced = set()
+        new_segments = []
+        new_verts = []
+        index = len(verts)-1
+        for j, s1 in enumerate(segments[:len(beziers)]):
+            if any(is_intersecting(t1,t2) for s2 in segments[j+1:] for t1, t2 in product(tri_segments(s1), tri_segments(s2))):
+                replaced.add(s1)
+                removed_vs.add(beziers[s1])
+                c0, mid, c1 = split_bezier(*verts[[s1[0], beziers[s1], s1[1]]])
+                new_verts.extend([c0, mid, c1])
+                new_segments.extend([(s1[0], index+2), (index+2, s1[1])])
+                beziers[(s1[0], index+2)] = index+1
+                beziers[(index+2, s1[1])] = index+3
+                index += 3
+        if not replaced:
+            break
+        verts = np.vstack([verts, new_verts])
+        segments = [s for s in segments + new_segments if s not in replaced]
+        beziers = {k:v for k,v in beziers.items() if k not in replaced}
+    else:
+        return None
+
+    remained_vs = list(set(range(len(verts))) - removed_vs)
+    oldv2newv = {x:i for i,x in enumerate(remained_vs)}
+    def olds2news(s):
+        a, b = s
+        return oldv2newv[a], oldv2newv[b]
+
+    verts = verts[remained_vs]
+    beziers = {olds2news(s) : oldv2newv[x] for (s,x) in beziers.items()}
+    segments = set(map(olds2news, segments))
+    segments_all = [ss for s in segments for ss in tri_segments(s)]
+
+    box = bounding_box(verts)
+    box_mid_pts = (np.vstack([box[1:], box[0]]) + box) / 2
+    verts = np.vstack([verts, box, box_mid_pts])
+    t = triangle.triangulate({'vertices': verts, 'segments': segments_all}, 'pcneYYq')
+
+    verts = t['vertices']
+    tris = t['triangles']
+    neighbors = t['neighbors']
+    first_tri = next(i for i, t in enumerate(neighbors) if np.any(t == -1))
+    windings = np.full(tris.shape[0], None)
+    def assign_winding_num(i, current):
+        windings[i] = current
+        for j, k in zip(neighbors[i], [[1,2],[2,0],[0,1]]):
+            if j != -1 and windings[j] is None:
+                e = tuple(tris[i,k])
+                diff = 1 if e in segments else -1 if e[::-1] in segments else 0
+                assign_winding_num(j, current + diff)
+    assign_winding_num(first_tri, 0)
+    assert(all(x is not None for x in windings))
+    is_interior = (windings % 2 == 1) if evenodd else (windings != 0)
+    bv = set(chain.from_iterable(segments))
+    assert(len(bv) == len(segments))
+    iv = set(tris[is_interior].flatten()) - bv
+    ev = set(tris[np.logical_not(is_interior)].flatten()) - bv
+
+    segments_with_flip = segments | set(s[::-1] for s in segments)
+    chords = {s:ii for x,ii in zip(tris, is_interior) for s in combinations(sorted(x), 2)
+              if set(s) <= bv and s not in segments_with_flip}
+    new_verts = []
+    index = len(verts)-1
+    split_chords = []
+    for (x,y),ii in chords.items():
+        new_verts.append((verts[x] + verts[y]) / 2)
+        index += 1
+        (iv if ii else ev).add(index)
+        split_chords.extend([(x,index), (y,index)])
+    for x in tris:
+        if bv >= set(x) and segments_with_flip >= set(combinations(x, 2)):
+            new_verts.append(np.sum(verts[x], axis=0) / 3)
+            index += 1
+            iv.add(index)
+    if new_verts:
+        segments_all = [s for s in map(tuple, np.sort(t['edges'])) if s not in chords] + split_chords
+        verts = np.vstack([verts, new_verts])
+        t = triangle.triangulate({'vertices': verts, 'segments': segments_all}, 'p')
+        assert(verts.shape == t['vertices'].shape)
+
+    for x in t['triangles']:
+        z = 1
+        xi, xb, xe = ((set(x) & vv) for vv in (iv, bv, ev))
+        if len(xi) == 3:
+            a,b,c = xi
+            w = tri_uv_packed(0,0,0)
+        elif len(xi) == 2 and len(xb) == 1:
+            a,b = xi
+            c, = xb
+            w = tri_uv_packed(0,0,0)
+        elif len(xi) == 1 and len(xb) == 2:
+            a,b = xb
+            c, = xi
+            if (a,b) not in beziers:
+                a, b = b, a
+            if (a,b) not in beziers:
+                w = tri_uv_packed(1,1,0)
+            elif beziers[(a,b)] == c:
+                w = -1
+                z = -1
+            else:
+                w = tri_uv_packed(1,-1,0)
+        elif len(xb) == 2 and len(xe) == 1:
+            a,b = xb
+            c, = xe
+            if (a,b) not in beziers:
+                a, b = b, a
+            if (a,b) not in beziers:
+                w = tri_uv_packed(1,1,2)
+            elif beziers[(a,b)] == c:
+                w = -1
+            else:
+                continue
+        elif len(xb) == 1 and len(xe) == 2:
+            continue
+        elif len(xe) == 3:
+            continue
+        else:
+            print(f"unexpected #i, #b, #e = {[len(xi), len(xb), len(xe)]}", )
+            continue
+        data.extend([(*rescale(verts[a]), *rescale(verts[b])),
+                     (*rescale(verts[c]), z, w)])
+    return data
+
+def merge_subpaths(subpaths):
+    verts = np.vstack([p[0] for p in subpaths])
+    v_offsets = list(accumulate((p[0].shape[0] for p in subpaths), initial=0))
+    segments = list(map(tuple, np.vstack([np.array(p[1]) + offset for p, offset in zip(subpaths, v_offsets)])))
+    beziers = [np.array([k+(v,) for k,v in p[2].items()]) + offset for p, offset in zip(subpaths, v_offsets) if p[2]]
+    beziers = {(a,b):c for a,b,c in np.vstack(beziers)} if beziers else {}
+    return verts, segments, beziers
+
+def encode_curve(o, rescale):
+    if isinstance(o, LTLine):
+        return encode_line(o, rescale)
+
+    shape = "".join(x[0] for x in o.original_path)
+    subpaths = [parse_subpath(o.original_path[m.start():m.end()], o.fill)
+                for m in re.finditer(r"m[^m]+", shape)]
+
     data = []
 
     if o.stroke:
-        def control_pts(s):
-            a, b = verts[s[0]], verts[s[1]]
-            c = verts[beziers[s]] if s in beziers else (a + b) / 2
-            return a,c,b
+        for verts, segments, beziers in subpaths:
+            def control_pts(s):
+                a, b = verts[s[0]], verts[s[1]]
+                c = verts[beziers[s]] if s in beziers else (a + b) / 2
+                return a,c,b
+            data.extend(encode_spline(map(control_pts, segments), o.dashing_style, o.linewidth, rescale))
 
-        data.extend(encode_spline(map(control_pts, segments), o.dashing_style, o.linewidth, rescale))
-
-    # For fill we follow this paper, but with quadratic beziers only
-    # https://www.microsoft.com/en-us/research/wp-content/uploads/2005/01/p1000-loop.pdf
     if o.fill and is_black(o.non_stroking_color):
-        def is_intersecting(s, t):
-            return not (set(s) & set(t)) and segment_intersect(*verts[list(s+t)]) 
-
-        if any(is_intersecting(s,t) for s,t in combinations(set(segments) - set(beziers), 2)):
-            print("Self-intersection detected. Skipping")
-            print(o.original_path)
-            return data
-
-        def tri_segments(s):
-            return combinations(s + (beziers[s],), 2) if s in beziers else [s]
-
-        removed_vs = set()
-        for _ in range(5):
-            segments.sort(key=lambda s: -norm(verts[s[0]]-verts[s[1]]) if s in beziers else 1)
-            replaced = set()
-            new_segments = []
-            new_verts = []
-            index = len(verts)-1
-            for j, s1 in enumerate(segments[:len(beziers)]):
-                if any(is_intersecting(t1,t2) for s2 in segments[j+1:] for t1, t2 in product(tri_segments(s1), tri_segments(s2))):
-                    replaced.add(s1)
-                    removed_vs.add(beziers[s1])
-                    c0, mid, c1 = split_bezier(*verts[[s1[0], beziers[s1], s1[1]]])
-                    new_verts.extend([c0, mid, c1])
-                    new_segments.extend([(s1[0], index+2), (index+2, s1[1])])
-                    beziers[(s1[0], index+2)] = index+1
-                    beziers[(index+2, s1[1])] = index+3
-                    index += 3
-            if not replaced:
-                break
-            verts = np.vstack([verts, new_verts])
-            segments = [s for s in segments + new_segments if s not in replaced]
-            beziers = {k:v for k,v in beziers.items() if k not in replaced}
+        verts, segments, beziers = merge_subpaths(subpaths)
+        fill_data = encode_curve_fill(verts, segments, beziers, rescale, o.evenodd)
+        if fill_data is None:
+            for verts, segments, beziers in subpaths:
+                fill_data = encode_curve_fill(verts, segments, beziers, rescale, o.evenodd)
+                if fill_data is None:
+                    print("Self-intersection detected. Skipping")
+                    print(o.original_path)
+                else:
+                    data.extend(fill_data)
         else:
-            print("Possible self-intersection. Skipping")
-            print(o.original_path)
-            return data
-        
-        reordered_vs = []
-        next_v = dict(segments)
-        i = segments[0][0]
-        while True:
-            reordered_vs.append(i)
-            i = next_v[i]
-            if i == segments[0][0]:
-                break
-        verts_reordered = verts[reordered_vs]
-        n = len(verts_reordered)
-        max_id = max(range(n), key=lambda x: tuple(verts_reordered[x]))
-        path_is_clockwise = is_clockwise(*verts_reordered[np.arange(max_id-1, max_id+2) % n])
-        bv = set(reordered_vs)
-        iv = set()
-        ev = set()
-        for (a,b),c in beziers.items():
-            is_convex_fill = is_clockwise(*verts[[a,c,b]]) == path_is_clockwise
-            (ev if is_convex_fill else iv).add(c)
-        assert(bv | iv | ev | removed_vs == set(range(len(verts))))
-
-        # -------------------- no winding direction information below this line --------------------
-
-        remained_vs = list(set(range(len(verts))) - removed_vs)
-        oldv2newv = {x:i for i,x in enumerate(remained_vs)}
-        def olds2news(s):
-            return tuple(sorted(oldv2newv[x] for x in s))
-
-        verts = verts[remained_vs]
-        bv = set(oldv2newv[x] for x in bv)
-        iv = set(oldv2newv[x] for x in iv)
-        ev = set(oldv2newv[x] for x in ev)
-        beziers = {olds2news(s) : oldv2newv[x] for (s,x) in beziers.items()}
-        segments = set(map(olds2news, segments))
-        segments_all = [ss for s in segments for ss in tri_segments(s)]
-
-        box, ext_pt = bounding_box(verts)
-        verts = np.vstack([verts, box])
-        ev |= set(range(len(verts)-4, len(verts)))
-        t = triangle.triangulate({'vertices': verts,
-                                  'segments': segments_all,
-                                  'regions': [(*ext_pt, 1, 0)]}, 
-                                  'pAc')
-        assert(verts.shape == t['vertices'].shape)
-
-        tris = np.sort(t['triangles'])
-        chords = {s:d for x,(d,) in zip(tris, t['triangle_attributes']) for s in combinations(x, 2)
-                  if set(s) <= bv and s not in segments}
-        new_verts = []
-        index = len(verts)-1
-        split_chords = []
-        for (x,y),d in chords.items():
-            new_verts.append((verts[x] + verts[y]) / 2)
-            index += 1
-            (ev if d else iv).add(index)
-            split_chords.extend([(x,index), (y,index)])
-        for x in tris:
-            if bv >= set(x) and segments >= set(combinations(x, 2)):
-                new_verts.append(np.sum(verts[x], axis=0) / 3)
-                index += 1
-                iv.add(index)
-        if new_verts:
-            segments_all = list(set(s for x in tris for s in combinations(x, 2) if s not in chords)) + split_chords
-            verts = np.vstack([verts, new_verts])
-            t = triangle.triangulate({'vertices': verts,
-                                      'segments': segments_all}, 
-                                      'p')
-            assert(verts.shape == t['vertices'].shape)
-                
-        for x in t['triangles']:
-            z = 1
-            xi, xb, xe = ((set(x) & vv) for vv in (iv, bv, ev))
-            if len(xi) == 3:
-                a,b,c = xi
-                w = tri_uv_packed(0,0,0)
-            elif len(xi) == 2 and len(xb) == 1:
-                a,b = xi
-                c, = xb
-                w = tri_uv_packed(0,0,1)
-            elif len(xi) == 1 and len(xb) == 2:
-                a,b = sorted(xb)
-                c, = xi
-                if (a,b) not in beziers:
-                    w = tri_uv_packed(1,1,0)
-                elif beziers[(a,b)] == c:
-                    w = -1
-                    z = -1
-                else:
-                    w = tri_uv_packed(1,-1,0)
-            elif len(xb) == 2 and len(xe) == 1:
-                a,b = sorted(xb)
-                c, = xe
-                if (a,b) not in beziers:
-                    w = tri_uv_packed(1,1,2)
-                elif beziers[(a,b)] == c:
-                    w = -1
-                else:
-                    continue
-            elif len(xb) == 1 and len(xe) == 2:
-                continue
-            elif len(xe) == 3:
-                continue
-            else:
-                print(f"unexpected #i, #b, #e = {[len(xi), len(xb), len(xe)]}", )
-                continue
-            data.extend([(*rescale(verts[a]), *rescale(verts[b])),
-                         (*rescale(verts[c]), z, w)])
+            data.extend(fill_data)
 
     return data

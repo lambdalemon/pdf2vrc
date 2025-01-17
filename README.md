@@ -26,6 +26,5 @@ If successful, two textures, one `.png` and one `.exr` will be generated and pla
 ### Text
 - Horizontal scaling
 ### Curve
-- Curve fill with holes
 - Curve fill with self-intersection
 - Line cap & join style (currently defaults to hard cap for a single straight line and round otherwise)

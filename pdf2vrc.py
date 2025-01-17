@@ -242,6 +242,10 @@ def write_exr_texture(tex, filename):
     print(f"Encoded pdf in {filename}.")
 
 def run_atlas_gen(outname, indexer, font_filepaths, packed, atlas_size, do_not_regen_atlas):
+    if not indexer.fontnames():
+        print("pdf does not contain any glyphs. Skipping atlas generation")
+        return []
+
     font_args = []
     all_fontfiles_available = True
     for fontname in indexer.fontnames():

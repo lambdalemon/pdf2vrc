@@ -3,4 +3,4 @@ numpy == 2.2.1
 OpenEXR == 3.3.2
 freetype-py == 2.5.1
 triangle == 20250106
-pdfminer.six @ https://github.com/lambdalemon/pdfminer.six/archive/refs/tags/pdf2vrc-v1.zip
+pdfminer.six @ https://github.com/lambdalemon/pdfminer.six/archive/refs/tags/pdf2vrc-v2.zip
