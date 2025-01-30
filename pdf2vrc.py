@@ -21,8 +21,9 @@ import pymupdf
 import numpy as np
 import OpenEXR
 import freetype
+from PIL import Image
 
-from encode_curve import encode_curve
+from encode_curve import encode_curve, to_rgba
 
 def to_nfkd(ch):
     return unicodedata.normalize('NFKD', ch)
@@ -185,20 +186,28 @@ def get_page_data(page, glyph_indexer):
 
     chars = []
     others = []
+    color_chars = []
+    color_others = []
     for o in tree_walk(page):
         if isinstance(o, LTChar):
             atlas_id = glyph_indexer.get_atlas_id(o)
             if atlas_id is None:
                 continue
+            color = to_rgba(o.graphicstate.ncolor)
             if is_uniformly_scaled(o):
                 chars.append((*rescale(o.matrix[4:]), o.size * scale, atlas_id))
+                color_chars.append(color)
             else:
                 others.extend([np.array(o.matrix[:4]) * o.fontsize * scale,
                                (*rescale(o.matrix[4:]), atlas_id, 0)])
+                color_others.extend([color, color])
         elif isinstance(o, LTCurve):
-            others.extend(encode_curve(o, rescale=rescale))
+            data, color = encode_curve(o, rescale=rescale)
+            others.extend(data)
+            color_others.extend(color)
+
     meta = (len(chars) + len(others), len(chars), len(others) // 2, 0)
-    return meta, chars + others
+    return meta, chars + others, color_chars + color_others
 
 def min_pot_rect_greater(n):
     log2size = (n - 1).bit_length()
@@ -221,7 +230,8 @@ def encode_pdf_tex(pages, glyph_indexer, atlas_bounds, dtype):
     print(f'# of triangles required: {(max_num_quads - 1) // 32 + 1}')
     if atlas_bounds:
         print(f'Atlas Offset: {len(atlas_bounds)}')
-    offsets = accumulate((m[0] for m in meta), initial = len(data) + len(atlas_bounds))
+    header_size = len(atlas_bounds) + len(pages)
+    offsets = accumulate((m[0] for m in meta), initial=header_size)
     page_offset_f = page_offset_float16 if dtype == np.float16 else page_offset_float32
     final = list(chain(atlas_bounds,
                        map(page_offset_f, offsets, meta),
@@ -230,8 +240,13 @@ def encode_pdf_tex(pages, glyph_indexer, atlas_bounds, dtype):
     height, width = min_pot_rect_greater(len(final))
     tex = np.array(final, dtype=dtype)
     tex.resize(height, width, 4)
-    tex = tex[::-1]
-    return np.ascontiguousarray(tex)
+    tex = np.ascontiguousarray(tex[::-1])
+
+    tex_color = np.vstack([np.zeros((header_size, 4)), [x for d in data for x in d[2]]])
+    tex_color = (tex_color.astype(float) * 255).astype(np.uint8)
+    tex_color.resize(height, width, 4)
+    tex_color = np.ascontiguousarray(tex_color[::-1])
+    return tex, tex_color
 
 def write_exr_texture(tex, filename):
     channels = { "RGBA" : tex }
@@ -315,6 +330,7 @@ if __name__ == "__main__":
     parser.add_argument("--packed", help="generate a tightly packed atlas. recommended for math papers/books since these tend to have large variance between glyph sizes, and a large amount of atlas space will be otherwise wasted", action="store_true")
     parser.add_argument("--atlas-size", help="specify atlas size. if the default size is not large enough. PLEASE USE A POWER OF TWO LIKE 1024, 2048, 4096", type=int)
     parser.add_argument("--half", help="encode pdf as RGBA Half, which reduces texture memory usage", action="store_true")
+    parser.add_argument("--color", help="also extract colors", action="store_true")
     parser.add_argument("--do-not-regen-atlas", help="for testing purpose only", action="store_true")
 
     args = parser.parse_args()
@@ -338,7 +354,9 @@ if __name__ == "__main__":
     atlas_bounds = run_atlas_gen(outname, indexer, font_filepaths, args.packed, args.atlas_size, args.do_not_regen_atlas)
 
     dtype = np.float16 if args.half else np.float32
-    tex = encode_pdf_tex(pages, indexer, atlas_bounds, dtype)
+    tex, tex_color = encode_pdf_tex(pages, indexer, atlas_bounds, dtype)
     write_exr_texture(tex, f"out\\{outname}.exr")
-
+    if args.color:
+        Image.fromarray(tex_color).save(f"out\\{outname}_color.png")
+        print(f"Encoded color in out\\{outname}_color.png.")
 

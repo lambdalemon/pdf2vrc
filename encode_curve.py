@@ -17,7 +17,7 @@ def is_clockwise(x0, x1, x2):
     
 def line_intersect(x0, d0, x1, d1):
     d = det(d0, d1)
-    return np.array((-d1, d0)).T.dot(np.array((det(x0,d0), det(x1,d1)))) / d if d else None
+    return np.array((-d1, d0)).T.dot(np.array((det(x0,d0), det(x1,d1)))) / d if abs(d) > 1e-4 else None
 
 def segment_intersect(x0, x1, x2, x3):
     d = det(x0-x1, x2-x3)
@@ -46,6 +46,17 @@ def is_black(c, cutoff=1e-1):
         return len(c) == 3 and sum(c) < 3 * cutoff or len(c) == 4 and c[-1] > 1 - cutoff
     else:
         return c < cutoff
+
+def to_rgb(c):
+    if isinstance(c, Iterable):
+        return c if len(c) == 3 else (1 - np.array(c[:3])) * (1 - c[3])
+    elif isinstance(c, float):
+        return (c, c, c)
+    else:
+        return (0, 0, 0)
+
+def to_rgba(c):
+    return *to_rgb(c), 1
 
 def bounding_box(verts):
     hull_vecs = [verts[x] - verts[y] for x, y in triangle.convex_hull(verts)]
@@ -354,34 +365,41 @@ def merge_subpaths(subpaths):
 
 def encode_curve(o, rescale):
     if isinstance(o, LTLine):
-        return encode_line(o, rescale)
+        data = encode_line(o, rescale)
+        color = [to_rgba(o.stroking_color)] * len(data)
+        return data, color
 
     shape = "".join(x[0] for x in o.original_path)
     subpaths = [parse_subpath(o.original_path[m.start():m.end()], o.fill)
                 for m in re.finditer(r"m[^m]+", shape)]
 
     data = []
+    color = []
 
     if o.stroke:
+        stroke_data = []
         for verts, segments, beziers in subpaths:
             def control_pts(s):
                 a, b = verts[s[0]], verts[s[1]]
                 c = verts[beziers[s]] if s in beziers else (a + b) / 2
                 return a,c,b
-            data.extend(encode_spline(map(control_pts, segments), o.dashing_style, o.linewidth, rescale))
+            stroke_data.extend(encode_spline(map(control_pts, segments), o.dashing_style, o.linewidth, rescale))
+        data.extend(stroke_data)
+        color.extend([to_rgba(o.stroking_color)] * len(stroke_data))
 
-    if o.fill and is_black(o.non_stroking_color):
+    if o.fill:
         verts, segments, beziers = merge_subpaths(subpaths)
         fill_data = encode_curve_fill(verts, segments, beziers, rescale, o.evenodd)
         if fill_data is None:
+            fill_data = []
             for verts, segments, beziers in subpaths:
-                fill_data = encode_curve_fill(verts, segments, beziers, rescale, o.evenodd)
-                if fill_data is None:
+                subpath_data = encode_curve_fill(verts, segments, beziers, rescale, o.evenodd)
+                if subpath_data is None:
                     print("Self-intersection detected. Skipping")
                     print(o.original_path)
                 else:
-                    data.extend(fill_data)
-        else:
-            data.extend(fill_data)
+                    fill_data.extend(subpath_data)
+        data.extend(fill_data)
+        color.extend([to_rgba(o.non_stroking_color)] * len(fill_data))
 
-    return data
+    return data, color

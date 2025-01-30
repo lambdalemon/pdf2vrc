@@ -17,10 +17,9 @@ For more options
 ```
 python pdf2vrc.py --help
 ```
-If successful, two textures, one `.png` and one `.exr` will be generated and placed in the `out` directory. The script will also print out any necessary info not included in the textures.
+If successful, two textures, one `.png` and one `.exr` will be generated and placed in the `out` directory. If `--color` is used, another `.png` color texture will be generated. The script will also print out any necessary info not included in the textures.
 ## Known Missing Features
 ### General
-- Any color that isn't black
 - Transparency
 - Raster images
 ### Text
@@ -28,3 +27,5 @@ If successful, two textures, one `.png` and one `.exr` will be generated and pla
 ### Curve
 - Curve fill with self-intersection
 - Line cap & join style (currently defaults to hard cap for a single straight line and round otherwise)
+### Rendering
+- Shading (currently all contents on the page are rendered as unlit, which works if all colors are black / background is also unlit, but otherwise looks weird)
