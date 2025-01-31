@@ -42,7 +42,7 @@ def try_recover_unicode(o):
     ch = o.get_text()
     d = to_nfkd(ch)
     if d[:5] == '(cid:':
-        raise KeyError
+        return 0
     if d in LIGATURES:
         return LIGATURES[d]
     if o.font.is_vertical() and d in VERTICAL_PRESENTATION_FORMS:
@@ -63,9 +63,9 @@ class MyType1HeaderParser(PSStackParser):
 
 def get_type1_cid2gid(font, fontfile):
     r = []
-    if "Encoding" in font.spec:
+    if "Encoding" in font.spec and isinstance((encoding := resolve1(font.spec["Encoding"])), dict):
         cid = 0
-        for x in resolve1(font.spec["Encoding"])["Differences"]:
+        for x in encoding["Differences"]:
             if isinstance(x, int):
                 cid = x
             else:
@@ -83,14 +83,14 @@ def get_type1_cid2gid(font, fontfile):
         return get_unicode2gid(fontfile)
     face = freetype.Face(fontfile)
     cid2gid = {cid: face.get_name_index(bytes(cname, "ascii")) for cid, cname in r}
-    return lambda o: cid2gid[o.cid]
+    return lambda o: cid2gid.get(o.cid)
 
 class FontIndexer:
     def __init__(self, font, fontfile, by_unicode):
         self.unidentified_cids = set()
         # This will do for now...
         if fontfile is None:
-            self._indexer_map = lambda o: {}[o.cid]
+            self._indexer_map = lambda o: None
         elif by_unicode:
             self._indexer_map = get_unicode2gid(fontfile)
         elif isinstance(font, PDFType1Font) and not isinstance(font, PDFTrueTypeFont):
@@ -99,11 +99,11 @@ class FontIndexer:
             self._indexer_map = lambda o: o.cid
         else:
             self._indexer_map = get_unicode2gid(fontfile)
-        
+
     def indexer_map(self, o):
-        try:
-            return self._indexer_map(o)
-        except KeyError:
+        if g := self._indexer_map(o):
+            return g
+        else:
             self.unidentified_cids.add(o.cid)
             return None
 
@@ -129,7 +129,7 @@ class GlyphIndexer:
                 if o.fontname not in font_filepaths:
                     font_filepaths[o.fontname] = locate_external_fontfile(o.fontname)
                 self.font_indexers[o.font] = FontIndexer(o.font, font_filepaths[o.fontname], o.fontname in by_unicode_fonts)
-            if (g := self.indexer_map(o)) is not None:
+            if g := self.indexer_map(o):
                 glyphsets[o.fontname].add(g)
         self.glyphs_sorted = {k: sorted(v) for k,v in glyphsets.items()}
         self.atlas_index = {x: i for i,x in enumerate((k,g) for k,v in self.glyphs_sorted.items() for g in v)} 
