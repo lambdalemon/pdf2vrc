@@ -14,7 +14,7 @@ from pdfminer.psparser import PSStackParser, PSLiteral, KWD, literal_name
 from pdfminer.psexceptions import PSEOF
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar, LTCurve
-from pdfminer.pdffont import PDFType1Font, PDFTrueTypeFont
+from pdfminer.pdffont import PDFType1Font, PDFTrueTypeFont, PDFCIDFont
 from pdfminer.pdftypes import resolve1
 
 import pymupdf
@@ -49,6 +49,10 @@ def try_recover_unicode(o):
         return VERTICAL_PRESENTATION_FORMS[d]
     return ch
 
+def get_unicode2gid(fontfile):
+    face = freetype.Face(fontfile)
+    return lambda o: face.get_char_index(try_recover_unicode(o))
+
 class MyType1HeaderParser(PSStackParser):
     KEYWORD_PUT = KWD(b"put")
     def do_keyword(self, pos, token):
@@ -57,7 +61,7 @@ class MyType1HeaderParser(PSStackParser):
             if isinstance(key, int) and isinstance(value, PSLiteral) and literal_name(value) != '.notdef':
                 self.add_results((key, literal_name(value)))
 
-def get_type1_cid2gid(font):
+def get_type1_cid2gid(font, fontfile):
     r = []
     if "Encoding" in font.spec:
         cid = 0
@@ -76,22 +80,25 @@ def get_type1_cid2gid(font):
         except PSEOF:
             pass
     else:
-        print(f"Cannot determine encoding for {font.fontname}! Try using --unicode {font.fontname}")
-        return {}
-    face = freetype.Face(f"fonts\\{font.fontname}.pfa")
-    return {cid: face.get_name_index(bytes(cname, "ascii")) for cid, cname in r}
+        return get_unicode2gid(fontfile)
+    face = freetype.Face(fontfile)
+    cid2gid = {cid: face.get_name_index(bytes(cname, "ascii")) for cid, cname in r}
+    return lambda o: cid2gid[o.cid]
 
 class FontIndexer:
-    def __init__(self, font, by_unicode):
+    def __init__(self, font, fontfile, by_unicode):
         self.unidentified_cids = set()
-        # Certainly wrong but kind of works?...
-        if by_unicode:
-            self._indexer_map = try_recover_unicode
+        # This will do for now...
+        if fontfile is None:
+            self._indexer_map = lambda o: {}[o.cid]
+        elif by_unicode:
+            self._indexer_map = get_unicode2gid(fontfile)
         elif isinstance(font, PDFType1Font) and not isinstance(font, PDFTrueTypeFont):
-            self.cid2gid = get_type1_cid2gid(font)
-            self._indexer_map = lambda o: self.cid2gid[o.cid]
-        else:
+            self._indexer_map = get_type1_cid2gid(font, fontfile)
+        elif isinstance(font, PDFCIDFont) and font.cidcoding == "Adobe-Identity":
             self._indexer_map = lambda o: o.cid
+        else:
+            self._indexer_map = get_unicode2gid(fontfile)
         
     def indexer_map(self, o):
         try:
@@ -99,18 +106,29 @@ class FontIndexer:
         except KeyError:
             self.unidentified_cids.add(o.cid)
             return None
-        
+
+def locate_external_fontfile(fontname):
+    for ext in ("otf", "ttf"):
+        fontfile = f"fonts\\{fontname}.{ext}"
+        if Path(fontfile).is_file():
+            print(f"{fontname} is not embedded. Using {fontfile}")
+            return fontfile
+    else:
+        print(f"{fontname} is not embedded and no font file with matching name was found.")
+        return None
 
 class GlyphIndexer:
-    def __init__(self, glyphs, by_unicode_fonts):
+    def __init__(self, glyphs, font_filepaths, by_unicode_fonts):
         self.font_indexers = {}
-        self.by_unicode_fonts = by_unicode_fonts
         glyphsets = defaultdict(set)
+        self.font_filepaths = font_filepaths
         for o in glyphs:
             if to_nfkd(o.get_text()) == ' ':
                 continue
             if o.font not in self.font_indexers:
-                self.font_indexers[o.font] = FontIndexer(o.font, o.fontname in by_unicode_fonts)
+                if o.fontname not in font_filepaths:
+                    font_filepaths[o.fontname] = locate_external_fontfile(o.fontname)
+                self.font_indexers[o.font] = FontIndexer(o.font, font_filepaths[o.fontname], o.fontname in by_unicode_fonts)
             if (g := self.indexer_map(o)) is not None:
                 glyphsets[o.fontname].add(g)
         self.glyphs_sorted = {k: sorted(v) for k,v in glyphsets.items()}
@@ -119,8 +137,8 @@ class GlyphIndexer:
     def fontnames(self):
         return self.glyphs_sorted.keys()
 
-    def by_unicode(self, fontname):
-        return fontname in self.by_unicode_fonts
+    def all_fontfiles_available(self):
+        return all(f is not None for f in self.font_filepaths.values())
 
     def indexer_map(self, o):
         return self.font_indexers[o.font].indexer_map(o)
@@ -132,12 +150,8 @@ class GlyphIndexer:
 
     def write_glyphset_files(self):
         for k,v in self.glyphs_sorted.items():
-            if self.by_unicode(k):
-                charset = '"{}"'.format("".join( "\\"+c if c in "\\\"" else c for c in v ))
-                Path(f"fonts\\{k}-unicode.txt").write_text(charset, encoding="utf-8")
-            else:
-                Path(f"fonts\\{k}.txt").write_text(",".join(map(str, v)))
-    
+            Path(f"fonts\\{k}.txt").write_text(",".join(map(str, v)))
+
     def unidentified_cids(self):
         return [(font.fontname, list(indexer.unidentified_cids)) for font, indexer in self.font_indexers.items() 
                 if indexer.unidentified_cids]
@@ -256,28 +270,14 @@ def write_exr_texture(tex, filename):
         outfile.write(filename)
     print(f"Encoded pdf in {filename}.")
 
-def run_atlas_gen(outname, indexer, font_filepaths, packed, atlas_size, do_not_regen_atlas):
+def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
     if not indexer.fontnames():
         print("pdf does not contain any glyphs. Skipping atlas generation")
         return []
 
     font_args = []
-    all_fontfiles_available = True
     for fontname in indexer.fontnames():
-        if fontname in font_filepaths:
-            fontfile = font_filepaths[fontname]
-        else:
-            for ext in ("otf", "ttf"):
-                fontfile = f"fonts\\{fontname}.{ext}"
-                if Path(fontfile).is_file():
-                    print(f"{fontname} is not embedded. Using {fontfile}")
-                    break
-            else:
-                all_fontfiles_available = False
-                print(f"{fontname} is not embedded and no font file with matching name was found.")
-
-        args = ["-font", fontfile] + (["-charset", f"fonts\\{fontname}-unicode.txt"] if indexer.by_unicode(fontname) else 
-                                      ["-glyphset", f"fonts\\{fontname}.txt"])
+        args = ["-font", indexer.font_filepaths[fontname], "-glyphset", f"fonts\\{fontname}.txt"]
         if font_args:
             font_args.append("-and")
         font_args.extend(args)
@@ -288,62 +288,49 @@ def run_atlas_gen(outname, indexer, font_filepaths, packed, atlas_size, do_not_r
     all_args = ["msdf-atlas-gen.exe", "-imageout", f"out\\{outname}_atlas.png", "-json", f"out\\{outname}_atlas.json", 
                 "-outerpxpadding", "2"] + dim_args + grid_args + font_args
 
-    if all_fontfiles_available:
-        if not do_not_regen_atlas:
-            print("=================================== Running MSDF Atlas Gen ===================================")
-            # print(" ".join(all_args))
-            subprocess.run(all_args)
-            print("==============================================================================================")
-        
-        atlas_json = json.loads(Path(f"out\\{outname}_atlas.json").read_text())
-        atlas_size = atlas_json["atlas"]["width"]
-        bounds = (bounds
-                  for variant in atlas_json.get("variants", (atlas_json,))
-                  for glyph in variant["glyphs"]
-                  for bounds in (np.array(list(glyph["planeBounds"].values())), 
-                                 np.array(list(glyph["atlasBounds"].values())) / atlas_size))
-        if packed:
-            return list(bounds)
-        else:
-            print(f"Plane Bounds: {next(bounds)}")
+    if not do_not_regen_atlas:
+        print("=================================== Running MSDF Atlas Gen ===================================")
+        subprocess.run(all_args)
+        print("==============================================================================================")
+
+    atlas_json = json.loads(Path(f"out\\{outname}_atlas.json").read_text())
+    atlas_size = atlas_json["atlas"]["width"]
+    bounds = [bounds
+              for variant in atlas_json.get("variants", (atlas_json,))
+              for glyph in variant["glyphs"]
+              for bounds in (np.array(list(glyph["planeBounds"].values())), 
+                             np.array(list(glyph["atlasBounds"].values())) / atlas_size)]
+    if packed:
+        return bounds
     else:
-        if packed:
-            sys.exit("Cannot encode pdf without generating atlas first when --packed is used! Exiting...")
-        else:
-            print("Please acquire missing fonts then run the following command to generate the glyph atlas:")
-            print(" ".join(all_args))
+        print(f"Plane Bounds: {bounds[0]}")
+        return []
 
-    return []
-
-
-class Everything(set):
-    def __contains__(self, item):
-        return True
-EVERYTHING = Everything()
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("filename")
-    parser.add_argument('--unicode', help="extract a list of fonts by unicode. try this when a font has unidentified cids", nargs="*", metavar="FONT")
-    parser.add_argument("--unicode-all", help="extract all fonts by unicode", action="store_true")
     parser.add_argument("--packed", help="generate a tightly packed atlas. recommended for math papers/books since these tend to have large variance between glyph sizes, and a large amount of atlas space will be otherwise wasted", action="store_true")
     parser.add_argument("--atlas-size", help="specify atlas size. if the default size is not large enough. PLEASE USE A POWER OF TWO LIKE 1024, 2048, 4096", type=int)
     parser.add_argument("--half", help="encode pdf as RGBA Half, which reduces texture memory usage", action="store_true")
     parser.add_argument("--color", help="also extract colors", action="store_true")
+    parser.add_argument('--unicode', help="extract a list of fonts by unicode", nargs="*", metavar="FONT")
     parser.add_argument("--do-not-regen-atlas", help="for testing purpose only", action="store_true")
 
     args = parser.parse_args()
-    pages = list(extract_pages(Path(args.filename)))
     outname = args.filename[:-4] + ("_packed" if args.packed else "") + ("_half" if args.half else "")
-    by_unicode_fonts = EVERYTHING if args.unicode_all else set(args.unicode) if args.unicode else set()
+    by_unicode_fonts = set(args.unicode) if args.unicode else set()
 
     Path.mkdir(Path("fonts"), exist_ok=True)
     Path.mkdir(Path("out"), exist_ok=True)
     font_filepaths = extract_embedded_fonts(args.filename)
-
+    pages = list(extract_pages(Path(args.filename)))
     glyphs = filter(lambda o: isinstance(o, LTChar), tree_walk(pages))
-    indexer = GlyphIndexer(glyphs, by_unicode_fonts)
+    indexer = GlyphIndexer(glyphs, font_filepaths, by_unicode_fonts)
+
+    if not indexer.all_fontfiles_available():
+        sys.exit("Please acquire missing fonts and try again.")
     if indexer.unidentified_cids():
         print("Failed to identify the following cids:")
         for fontname, cids in indexer.unidentified_cids():
@@ -351,7 +338,7 @@ if __name__ == "__main__":
 
     indexer.write_glyphset_files()
 
-    atlas_bounds = run_atlas_gen(outname, indexer, font_filepaths, args.packed, args.atlas_size, args.do_not_regen_atlas)
+    atlas_bounds = run_atlas_gen(outname, indexer, args.packed, args.atlas_size, args.do_not_regen_atlas)
 
     dtype = np.float16 if args.half else np.float32
     tex, tex_color = encode_pdf_tex(pages, indexer, atlas_bounds, dtype)
