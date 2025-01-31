@@ -3,3 +3,4 @@ __pycache__
 fonts
 out
 msdf-atlas-gen.exe
+*.ipynb
