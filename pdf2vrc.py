@@ -61,9 +61,14 @@ class MyType1HeaderParser(PSStackParser):
             if isinstance(key, int) and isinstance(value, PSLiteral) and literal_name(value) != '.notdef':
                 self.add_results((key, literal_name(value)))
 
+def cid2gid_from_cid2name(cid2name, fontfile):
+    face = freetype.Face(fontfile)
+    cid2gid = {cid: face.get_name_index(bytes(cname, "ascii")) for cid, cname in cid2name}
+    return lambda o: cid2gid.get(o.cid)
+
 def get_type1_cid2gid(font, fontfile):
-    r = []
     if "Encoding" in font.spec and isinstance((encoding := resolve1(font.spec["Encoding"])), dict):
+        r = []
         cid = 0
         for x in encoding["Differences"]:
             if isinstance(x, int):
@@ -71,7 +76,9 @@ def get_type1_cid2gid(font, fontfile):
             else:
                 r.append((cid, literal_name(x)))
                 cid += 1
+        return cid2gid_from_cid2name(r, fontfile)
     elif hasattr(font, "fontfile"):
+        r = []
         data = font.fontfile.get_data()[:font.fontfile["Length1"]]
         parser = MyType1HeaderParser(BytesIO(data))
         try:
@@ -79,11 +86,11 @@ def get_type1_cid2gid(font, fontfile):
                 r.append(parser.nextobject())
         except PSEOF:
             pass
+        return cid2gid_from_cid2name(r, fontfile)
+    elif hasattr(font, "cfffont") and font.cfffont is not None:
+        return lambda o: font.cfffont.code2gid.get(o.cid)
     else:
         return get_unicode2gid(fontfile)
-    face = freetype.Face(fontfile)
-    cid2gid = {cid: face.get_name_index(bytes(cname, "ascii")) for cid, cname in r}
-    return lambda o: cid2gid.get(o.cid)
 
 class FontIndexer:
     def __init__(self, font, fontfile, by_unicode):

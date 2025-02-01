@@ -23,7 +23,7 @@ If successful, two textures, one `.png` and one `.exr` will be generated and pla
 - Transparency
 - Raster images
 ### Text
-- CFF fonts
+- Certain types of fonts (no idea which ones though)
 - Horizontal scaling
 ### Curve
 - Curve fill with self-intersection
