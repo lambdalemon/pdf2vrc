@@ -50,7 +50,7 @@ def is_black(c, cutoff=1e-1):
 def to_rgb(c):
     if isinstance(c, Iterable):
         return c if len(c) == 3 else (1 - np.array(c[:3])) * (1 - c[3])
-    elif isinstance(c, float):
+    elif isinstance(c, float | int):
         return (c, c, c)
     else:
         return (0, 0, 0)
