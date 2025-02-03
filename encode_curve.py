@@ -24,7 +24,7 @@ def segment_intersect(x0, x1, x2, x3):
     if d == 0:
         return False
     t = np.array((det(x0-x2, x2-x3), det(x1-x0, x0-x2))) / d
-    return all((0<t) & (t<1))
+    return all((0<=t) & (t<=1))
 
 def cubic2quads(x0, x1, x2, x3):
     mid = (x0 + 3 * (x1 + x2) + x3) / 8
@@ -172,17 +172,31 @@ def parse_subpath(path, always_close):
     verts = [np.array(path[0][1])]
     segments = []
     beziers = {}
+
+    def add_vert(x):
+        if x is None:
+            return None
+        for i, y in enumerate(verts):
+            if norm(x-y) < 1e-2:
+                return i
+        verts.append(x)
+        return len(verts)-1
+
+    def add_segment(v, b=None):
+        last_v = segments[-1][1] if segments else 0
+        if last_v == v:
+            return
+        segments.append((last_v, v))
+        if b is not None:
+            beziers[(last_v, v)] = b
+
     for t, *xs in path[1:]:
-        index = len(verts)-1
         if t == 'h':
-            if norm(verts[0] - verts[-1]) > 1e-4:
-                segments.append((index, 0))
+            add_segment(0)
             break
-        if norm(np.array(xs[-1]) - verts[-1]) < 1e-1:
-            continue
         if t == 'l':
-            verts.append(np.array(xs[-1]))
-            segments.append((index, index+1))
+            v = add_vert(np.array(xs[-1]))
+            add_segment(v)
         else:
             # Each cubic bezier is approximated with two quadratic beziers
             x0 = verts[-1]
@@ -192,25 +206,11 @@ def parse_subpath(path, always_close):
                         [x0] + xs + [x3] if t == 'y' else None
             c0, mid, c1 = cubic2quads(*np.array(cubic_pts))
             for y0, y1, y2 in ((x0, c0, mid), (mid, c1, x3)):
-                index = len(verts)-1
-                if y1 is not None and min(norm(y1-y0), norm(y1-y2), norm(y2-y0)) > 1e-1:
-                    verts.extend([y1, y2])
-                    segments.append((index, index+2))
-                    beziers[(index, index+2)] = index+1
-                else:
-                    verts.append(y2)
-                    segments.append((index, index+1))
-
-    index = len(verts)-1
-    if norm(verts[0] - verts[-1]) < 1e-4:
-        if segments:
-            segments[-1] = (segments[-1][0], 0)
-        del verts[-1]
-        if (index-2, index) in beziers:
-            beziers[(index-2, 0)] = beziers[(index-2, index)]
-            del beziers[(index-2, index)]
-    elif always_close and t != 'h':
-        segments.append((index, 0))
+                v1 = add_vert(y1)
+                v2 = add_vert(y2)
+                add_segment(v2, v1)
+    if always_close:
+        add_segment(0)
 
     return np.array(verts), segments, beziers
 
