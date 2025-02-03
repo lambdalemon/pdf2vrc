@@ -26,6 +26,13 @@ def segment_intersect(x0, x1, x2, x3):
     t = np.array((det(x0-x2, x2-x3), det(x1-x0, x0-x2))) / d
     return all((0<=t) & (t<=1))
 
+def is_collinear(x0, x1, x2):
+    d1, d2 = x0-x1, x0-x2
+    return abs(det(d1, d2)) <= 1e-2 * norm(d1) * norm(d2)
+
+def pt_on_segment(x0, x1, x2):
+    return is_collinear(x0, x1, x2) and np.dot(x0-x1, x0-x2) < 0
+
 def cubic2quads(x0, x1, x2, x3):
     mid = (x0 + 3 * (x1 + x2) + x3) / 8
     mid_d = x3 + x2 - x1 - x0
@@ -40,12 +47,6 @@ def split_bezier(x0, x1, x2):
     c1 = (x2 + x1) / 2
     mid = (c0 + c1) / 2    
     return c0, mid, c1
-
-def is_black(c, cutoff=1e-1):
-    if isinstance(c, Iterable):
-        return len(c) == 3 and sum(c) < 3 * cutoff or len(c) == 4 and c[-1] > 1 - cutoff
-    else:
-        return c < cutoff
 
 def to_rgb(c):
     if isinstance(c, Iterable):
@@ -174,8 +175,6 @@ def parse_subpath(path, always_close):
     beziers = {}
 
     def add_vert(x):
-        if x is None:
-            return None
         for i, y in enumerate(verts):
             if norm(x-y) < 1e-2:
                 return i
@@ -206,7 +205,8 @@ def parse_subpath(path, always_close):
                         [x0] + xs + [x3] if t == 'y' else None
             c0, mid, c1 = cubic2quads(*np.array(cubic_pts))
             for y0, y1, y2 in ((x0, c0, mid), (mid, c1, x3)):
-                v1 = add_vert(y1)
+                is_bezier = y1 is not None and not is_collinear(y0, y1, y2)
+                v1 = add_vert(y1) if is_bezier else None
                 v2 = add_vert(y2)
                 add_segment(v2, v1)
     if always_close:
@@ -222,15 +222,32 @@ def encode_curve_fill(verts, segments, beziers, rescale, evenodd):
     def is_intersecting(s, t):
         return not (set(s) & set(t)) and segment_intersect(*verts[list(s+t)]) 
 
-    if any(is_intersecting(s,t) for s,t in combinations(set(segments) - set(beziers), 2)):
-        return None
-
     def tri_segments(s):
         return combinations(s + (beziers[s],), 2) if s in beziers else [s]
+
+    bv = set(chain.from_iterable(segments))
+    for _ in range(3):
+        replaced = set()
+        new_segments = []
+        for v1, v2 in set(segments) - set(beziers):
+            for v0 in bv:
+                if pt_on_segment(*verts[[v0,v1,v2]]):
+                    replaced.add((v1, v2))
+                    new_segments.extend([(v1, v0), (v0, v2)])
+                    break
+        if not replaced:
+            break
+        segments = [s for s in segments + new_segments if s not in replaced]
+
+    if any(is_intersecting(s,t) for s,t in combinations(set(segments) - set(beziers), 2)):
+        return None
 
     removed_vs = set()
     for _ in range(5):
         segments.sort(key=lambda s: -norm(verts[s[0]]-verts[s[1]]) if s in beziers else 1)
+        for (s, v0), (v1, v2) in product(beziers.items(), segments[len(beziers):]):
+            if pt_on_segment(*verts[[v0,v1,v2]]):
+                verts[v0] = lerp(verts[v0], (verts[s[0]] + verts[s[1]])/2, 1e-2)
         replaced = set()
         new_segments = []
         new_verts = []
@@ -285,7 +302,6 @@ def encode_curve_fill(verts, segments, beziers, rescale, evenodd):
     assert(all(x is not None for x in windings))
     is_interior = (windings % 2 == 1) if evenodd else (windings != 0)
     bv = set(chain.from_iterable(segments))
-    assert(len(bv) == len(segments))
     iv = set(tris[is_interior].flatten()) - bv
     ev = set(tris[np.logical_not(is_interior)].flatten()) - bv
 
