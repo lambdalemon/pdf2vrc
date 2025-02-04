@@ -8,12 +8,15 @@ from io import BytesIO
 import subprocess
 import json
 import sys
+import glob
 from collections import defaultdict
 
 from pdfminer.psparser import PSStackParser, PSLiteral, KWD, literal_name
 from pdfminer.psexceptions import PSEOF
 from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTChar, LTCurve
+from pdfminer.layout import LTChar, LTCurve, LTImage, LTFigure
+from pdfminer.utils import mult_matrix
+from pdfminer.image import ImageWriter
 from pdfminer.pdffont import PDFType1Font, PDFTrueTypeFont, PDFCIDFont
 from pdfminer.pdftypes import resolve1
 
@@ -22,6 +25,7 @@ import numpy as np
 import OpenEXR
 import freetype
 from PIL import Image
+import PyTexturePacker
 
 from encode_curve import encode_curve, to_rgba
 
@@ -196,7 +200,7 @@ def tree_walk(o):
 def is_uniformly_scaled(o):
     return o.matrix[0] == o.matrix[3] and o.matrix[1] == 0 and o.matrix[2] == 0
 
-def get_page_data(page, glyph_indexer):
+def get_page_data(page, glyph_indexer, img_index, img_id_offset):
     half_width = page.width / 2
     half_height = page.height / 2
     scale = 1 / max(page.width, page.height)
@@ -209,6 +213,8 @@ def get_page_data(page, glyph_indexer):
     others = []
     color_chars = []
     color_others = []
+    last_matrix = None
+    ROTATED_IMG_MATRIX = (0,1,-1,0,1,0)
     for o in tree_walk(page):
         if isinstance(o, LTChar):
             atlas_id = glyph_indexer.get_atlas_id(o)
@@ -226,6 +232,15 @@ def get_page_data(page, glyph_indexer):
             data, color = encode_curve(o, rescale=rescale)
             others.extend(data)
             color_others.extend(color)
+        elif isinstance(o, LTFigure):
+            last_matrix = o.matrix
+        elif isinstance(o, LTImage) and img_index:
+            img_id, rotated = img_index[o.stream]
+            matrix = mult_matrix(ROTATED_IMG_MATRIX, last_matrix) if rotated else last_matrix
+            others.extend([np.array(matrix[:4]) * scale,
+                           (*rescale(matrix[4:]), img_id + img_id_offset, 2048)])
+            color = (0,0,0,0)
+            color_others.extend([color, color])
 
     meta = (len(chars) + len(others), len(chars), len(others) // 2, 0)
     return meta, chars + others, color_chars + color_others
@@ -242,13 +257,14 @@ def page_offset_float16(offset, m):
     buf_uint16 = np.array((high, *m[1:3], low), dtype=np.uint16)
     return np.frombuffer(buf_uint16, dtype=np.float16)
 
-def encode_pdf_tex(pages, glyph_indexer, atlas_bounds, dtype):
-    data = [get_page_data(p, glyph_indexer) for p in pages]
+def encode_pdf_tex(pages, glyph_indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype):
+    data = [get_page_data(p, glyph_indexer, img_index, len(glyph_atlas_bounds)) for p in pages]
     meta = [d[0] for d in data]
     max_num_quads = max(sum(m[1:]) for m in meta)
     print(f"Page Size: {pages[0].width}, {pages[0].height}")
     print(f'# of pages: {len(data)}')
     print(f'# of triangles required: {(max_num_quads - 1) // 32 + 1}')
+    atlas_bounds = glyph_atlas_bounds + img_atlas_bounds
     if atlas_bounds:
         print(f'Atlas Offset: {len(atlas_bounds)}')
     header_size = len(atlas_bounds) + len(pages)
@@ -313,6 +329,30 @@ def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
         print(f"Plane Bounds: {bounds[0]}")
         return []
 
+def extract_images(pages, outname, do_extract):
+    if not do_extract:
+        return [], {}
+    img_dir = f".\\images\\{outname}"
+    for f in glob.glob(f"{img_dir}\\*"):
+        Path(f).unlink()
+    img_writer = ImageWriter(img_dir)
+    imgs = {o.stream: o for o in tree_walk(pages) if isinstance(o, LTImage)}
+    img_files = [img_writer.export_image(o) for o in imgs.values()]
+    packer = PyTexturePacker.Packer.create(max_width=8192,
+                                           max_height=8192,
+                                           reduce_border_artifacts=True,
+                                           atlas_format=PyTexturePacker.Utils.ATLAS_FORMAT_JSON)
+    packer.pack(img_dir, f"out\\{outname}_image_atlas")
+    print(f"Packed images in out\\{outname}_image_atlas.png")
+    atlas_json = json.loads(Path(f"out\\{outname}_image_atlas.json").read_text())
+    atlas_w, atlas_h = atlas_json["meta"]["size"].values()
+    def frame_to_atlasbounds(frame):
+        x, y, w, h = frame.values()
+        return np.array([x, atlas_h-(y+h), x+w, atlas_h-y]) / [atlas_w, atlas_h, atlas_w, atlas_h]
+    bounds = [frame_to_atlasbounds(atlas_json["frames"][f]['frame']) for f in img_files]
+    img_index = {s: (i, atlas_json["frames"][f]['rotated']) for i, (s, f) in enumerate(zip(imgs, img_files))}
+    return bounds, img_index
+
 
 if __name__ == "__main__":
 
@@ -322,6 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--atlas-size", help="specify atlas size. if the default size is not large enough. PLEASE USE A POWER OF TWO LIKE 1024, 2048, 4096", type=int)
     parser.add_argument("--half", help="encode pdf as RGBA Half, which reduces texture memory usage", action="store_true")
     parser.add_argument("--color", help="also extract colors", action="store_true")
+    parser.add_argument("--image", help="also extract images", action="store_true")
     parser.add_argument('--unicode', help="extract a list of fonts by unicode", nargs="*", metavar="FONT")
     parser.add_argument("--do-not-regen-atlas", help="for testing purpose only", action="store_true")
 
@@ -345,10 +386,11 @@ if __name__ == "__main__":
 
     indexer.write_glyphset_files()
 
-    atlas_bounds = run_atlas_gen(outname, indexer, args.packed, args.atlas_size, args.do_not_regen_atlas)
+    glyph_atlas_bounds = run_atlas_gen(outname, indexer, args.packed, args.atlas_size, args.do_not_regen_atlas)
+    img_atlas_bounds, img_index = extract_images(pages, outname, args.image)
 
     dtype = np.float16 if args.half else np.float32
-    tex, tex_color = encode_pdf_tex(pages, indexer, atlas_bounds, dtype)
+    tex, tex_color = encode_pdf_tex(pages, indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype)
     write_exr_texture(tex, f"out\\{outname}.exr")
     if args.color:
         Image.fromarray(tex_color).save(f"out\\{outname}_color.png")

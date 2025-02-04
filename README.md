@@ -17,16 +17,22 @@ For more options
 ```
 python pdf2vrc.py --help
 ```
-If successful, two textures, one `.png` and one `.exr` will be generated and placed in the `out` directory. If `--color` is used, another `.png` color texture will be generated. The script will also print out any necessary info not included in the textures.
+If successful, two textures, one `.png` and one `.exr` will be generated and placed in the `out` directory.
+
+If `--color` is used, an additional `.png` color texture will be generated.
+
+If `--image` is used, an additional `.png` image atlas texture will be generated.
+
+The script will also print out any necessary info not included in the textures.
 ## Known Missing Features
-### General
-- Transparency
-- Raster images
 ### Text
 - Certain types of fonts (no idea which ones though)
 - Horizontal scaling
 ### Curve
 - Curve fill with self-intersection
 - Line cap & join style (currently defaults to hard cap for a single straight line and round otherwise)
+### Color
+- Transparency
+- Certain color spaces
 ### Rendering
 - Shading (currently all contents on the page are rendered as unlit, which works if all colors are black / background is also unlit, but otherwise looks weird)

@@ -4,4 +4,5 @@ OpenEXR == 3.3.2
 freetype-py == 2.5.1
 triangle == 20250106
 pillow == 11.1.0
+PyTexturePacker == 1.2.1
 pdfminer.six @ https://github.com/lambdalemon/pdfminer.six/archive/refs/tags/pdf2vrc-v3.zip
