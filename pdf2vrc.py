@@ -200,6 +200,9 @@ def tree_walk(o):
 def is_uniformly_scaled(o):
     return o.matrix[0] == o.matrix[3] and o.matrix[1] == 0 and o.matrix[2] == 0
 
+def img_hash(o):
+    return (str(o.stream.attrs), o.stream.get_data())
+
 def get_page_data(page, glyph_indexer, img_index, img_id_offset, no_curve):
     half_width = page.width / 2
     half_height = page.height / 2
@@ -234,8 +237,8 @@ def get_page_data(page, glyph_indexer, img_index, img_id_offset, no_curve):
             color_others.extend(color)
         elif isinstance(o, LTFigure):
             last_matrix = o.matrix
-        elif isinstance(o, LTImage) and img_index:
-            img_id, rotated = img_index[o.stream]
+        elif isinstance(o, LTImage) and (img_id_rotated := img_index.get(img_hash(o))):
+            img_id, rotated = img_id_rotated
             matrix = mult_matrix(ROTATED_IMG_MATRIX, last_matrix) if rotated else last_matrix
             others.extend([np.array(matrix[:4]) * scale,
                            (*rescale(matrix[4:]), img_id + img_id_offset, 2048)])
@@ -337,7 +340,7 @@ def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
         return []
 
 def extract_images(pages, outname):
-    imgs = {o.stream: o for o in tree_walk(pages) if isinstance(o, LTImage)}
+    imgs = {img_hash(o): o for o in tree_walk(pages) if isinstance(o, LTImage) and o.stream.get_filters()}
     if not imgs:
         return [], {}
     img_dir = f".\\images\\{outname}"
