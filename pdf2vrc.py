@@ -200,7 +200,7 @@ def tree_walk(o):
 def is_uniformly_scaled(o):
     return o.matrix[0] == o.matrix[3] and o.matrix[1] == 0 and o.matrix[2] == 0
 
-def get_page_data(page, glyph_indexer, img_index, img_id_offset):
+def get_page_data(page, glyph_indexer, img_index, img_id_offset, no_curve):
     half_width = page.width / 2
     half_height = page.height / 2
     scale = 1 / max(page.width, page.height)
@@ -228,7 +228,7 @@ def get_page_data(page, glyph_indexer, img_index, img_id_offset):
                 others.extend([np.array(o.matrix[:4]) * o.fontsize * scale,
                                (*rescale(o.matrix[4:]), atlas_id, 0)])
                 color_others.extend([color, color])
-        elif isinstance(o, LTCurve):
+        elif isinstance(o, LTCurve) and not no_curve:
             data, color = encode_curve(o, rescale=rescale)
             others.extend(data)
             color_others.extend(color)
@@ -257,8 +257,8 @@ def page_offset_float16(offset, m):
     buf_uint16 = np.array((high, *m[1:3], low), dtype=np.uint16)
     return np.frombuffer(buf_uint16, dtype=np.float16)
 
-def encode_pdf_tex(pages, glyph_indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype):
-    data = [get_page_data(p, glyph_indexer, img_index, len(glyph_atlas_bounds)) for p in pages]
+def encode_pdf_tex(pages, glyph_indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype, no_curve):
+    data = [get_page_data(p, glyph_indexer, img_index, len(glyph_atlas_bounds), no_curve) for p in pages]
     meta = [d[0] for d in data]
     max_num_quads = max(sum(m[1:]) for m in meta)
     print(f"Page Size: {pages[0].width}, {pages[0].height}")
@@ -292,6 +292,13 @@ def write_exr_texture(tex, filename):
     with OpenEXR.File(header, channels) as outfile:
         outfile.write(filename)
     print(f"Encoded pdf in {filename}.")
+
+def write_color_texture(tex, filename):
+    rgb, a = tex[:,:,:3], tex[:,:,3]
+    is_black = np.all(rgb == 0) and np.all(np.logical_or(a == 0, a == 255))
+    if not is_black:
+        Image.fromarray(tex).save(filename)
+        print(f"Encoded color in {filename}.")
 
 def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
     if not indexer.fontnames():
@@ -329,14 +336,14 @@ def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
         print(f"Plane Bounds: {bounds[0]}")
         return []
 
-def extract_images(pages, outname, do_extract):
-    if not do_extract:
+def extract_images(pages, outname):
+    imgs = {o.stream: o for o in tree_walk(pages) if isinstance(o, LTImage)}
+    if not imgs:
         return [], {}
     img_dir = f".\\images\\{outname}"
     for f in glob.glob(f"{img_dir}\\*"):
         Path(f).unlink()
     img_writer = ImageWriter(img_dir)
-    imgs = {o.stream: o for o in tree_walk(pages) if isinstance(o, LTImage)}
     img_files = [img_writer.export_image(o) for o in imgs.values()]
     packer = PyTexturePacker.Packer.create(max_width=8192,
                                            max_height=8192,
@@ -361,13 +368,12 @@ if __name__ == "__main__":
     parser.add_argument("--packed", help="generate a tightly packed atlas. recommended for math papers/books since these tend to have large variance between glyph sizes, and a large amount of atlas space will be otherwise wasted", action="store_true")
     parser.add_argument("--atlas-size", help="specify atlas size. if the default size is not large enough. PLEASE USE A POWER OF TWO LIKE 1024, 2048, 4096", type=int)
     parser.add_argument("--half", help="encode pdf as RGBA Half, which reduces texture memory usage", action="store_true")
-    parser.add_argument("--color", help="also extract colors", action="store_true")
-    parser.add_argument("--image", help="also extract images", action="store_true")
     parser.add_argument('--unicode', help="extract a list of fonts by unicode", nargs="*", metavar="FONT")
     parser.add_argument("--do-not-regen-atlas", help="for testing purpose only", action="store_true")
+    parser.add_argument("--no-curve", help="for testing purpose only", action="store_true")
 
     args = parser.parse_args()
-    outname = args.filename[:-4] + ("_packed" if args.packed else "") + ("_half" if args.half else "")
+    outname = args.filename[:-4] + ("_packed" if args.packed else "") + ("_half" if args.half else "") + ("_no-curve" if args.no_curve else "")
     by_unicode_fonts = set(args.unicode) if args.unicode else set()
 
     Path.mkdir(Path("fonts"), exist_ok=True)
@@ -387,12 +393,9 @@ if __name__ == "__main__":
     indexer.write_glyphset_files()
 
     glyph_atlas_bounds = run_atlas_gen(outname, indexer, args.packed, args.atlas_size, args.do_not_regen_atlas)
-    img_atlas_bounds, img_index = extract_images(pages, outname, args.image)
+    img_atlas_bounds, img_index = extract_images(pages, outname)
 
     dtype = np.float16 if args.half else np.float32
-    tex, tex_color = encode_pdf_tex(pages, indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype)
+    tex, tex_color = encode_pdf_tex(pages, indexer, glyph_atlas_bounds, img_atlas_bounds, img_index, dtype, args.no_curve)
     write_exr_texture(tex, f"out\\{outname}.exr")
-    if args.color:
-        Image.fromarray(tex_color).save(f"out\\{outname}_color.png")
-        print(f"Encoded color in out\\{outname}_color.png.")
-
+    write_color_texture(tex_color, f"out\\{outname}_color.png")
