@@ -11,14 +11,12 @@ import sys
 import glob
 from collections import defaultdict
 
-from pdfminer.psparser import PSStackParser, PSLiteral, KWD, literal_name
 from pdfminer.psexceptions import PSEOF
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar, LTCurve, LTImage, LTFigure
 from pdfminer.utils import mult_matrix
 from pdfminer.image import ImageWriter
 from pdfminer.pdffont import PDFType1Font, PDFTrueTypeFont, PDFCIDFont
-from pdfminer.pdftypes import resolve1
 
 import pymupdf
 import numpy as np
@@ -183,7 +181,6 @@ def get_page_data(page, glyph_indexer, img_index, img_id_offset, no_curve):
     color_chars = []
     color_others = []
     last_matrix = None
-    ROTATED_IMG_MATRIX = (0,1,-1,0,1,0)
     for o in tree_walk(page):
         if isinstance(o, LTChar):
             atlas_id = glyph_indexer.get_atlas_id(o)
@@ -203,11 +200,9 @@ def get_page_data(page, glyph_indexer, img_index, img_id_offset, no_curve):
             color_others.extend(color)
         elif isinstance(o, LTFigure):
             last_matrix = o.matrix
-        elif isinstance(o, LTImage) and (img_id_rotated := img_index.get(img_hash(o))):
-            img_id, rotated = img_id_rotated
-            matrix = mult_matrix(ROTATED_IMG_MATRIX, last_matrix) if rotated else last_matrix
-            others.extend([np.array(matrix[:4]) * scale,
-                           (*rescale(matrix[4:]), img_id + img_id_offset, 2048)])
+        elif isinstance(o, LTImage) and (img_id := img_index.get(img_hash(o))):
+            others.extend([np.array(last_matrix[:4]) * scale,
+                           (*rescale(last_matrix[4:]), img_id + img_id_offset, 2048)])
             color = (0,0,0,0)
             color_others.extend([color, color])
 
@@ -306,7 +301,7 @@ def run_atlas_gen(outname, indexer, packed, atlas_size, do_not_regen_atlas):
         return []
 
 def extract_images(pages, outname):
-    imgs = {img_hash(o): o for o in tree_walk(pages) if isinstance(o, LTImage) and o.stream.get_filters()}
+    imgs = {img_hash(o): o for o in tree_walk(pages) if isinstance(o, LTImage)}
     if not imgs:
         return [], {}
     img_dir = f".\\images\\{outname}"
@@ -317,6 +312,7 @@ def extract_images(pages, outname):
     packer = PyTexturePacker.Packer.create(max_width=8192,
                                            max_height=8192,
                                            reduce_border_artifacts=True,
+                                           enable_rotated=False,
                                            atlas_format=PyTexturePacker.Utils.ATLAS_FORMAT_JSON)
     packer.pack(img_dir, f"out\\{outname}_image_atlas")
     print(f"Packed images in out\\{outname}_image_atlas.png")
@@ -326,7 +322,7 @@ def extract_images(pages, outname):
         x, y, w, h = frame.values()
         return np.array([x, atlas_h-(y+h), x+w, atlas_h-y]) / [atlas_w, atlas_h, atlas_w, atlas_h]
     bounds = [frame_to_atlasbounds(atlas_json["frames"][f]['frame']) for f in img_files]
-    img_index = {s: (i, atlas_json["frames"][f]['rotated']) for i, (s, f) in enumerate(zip(imgs, img_files))}
+    img_index = {s: i for i, s in enumerate(imgs)}
     return bounds, img_index
 
 
