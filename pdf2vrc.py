@@ -320,6 +320,10 @@ def extract_images(pages, outname):
     atlas_w, atlas_h = atlas_json["meta"]["size"].values()
     def frame_to_atlasbounds(frame):
         x, y, w, h = frame.values()
+        if w == 1:
+            x += 0.5; w = 0
+        if h == 1:
+            y += 0.5; h = 0
         return np.array([x, atlas_h-(y+h), x+w, atlas_h-y]) / [atlas_w, atlas_h, atlas_w, atlas_h]
     bounds = [frame_to_atlasbounds(atlas_json["frames"][f]['frame']) for f in img_files]
     img_index = {s: i for i, s in enumerate(imgs)}
