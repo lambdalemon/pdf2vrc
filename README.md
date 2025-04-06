@@ -39,9 +39,9 @@ python pdf2vrc.py --help
 ```
 If successful, two textures, one `.png` and one `.exr` will be generated and placed in the `out` directory.
 
-If `--color` is used, an additional `.png` color texture will be generated.
+If your pdf contains non-black text / vector graphics, an additional `.png` color texture will be generated.
 
-If `--image` is used, an additional `.png` image atlas texture will be generated.
+If your pdf contains raster images, an additional `.png` image atlas texture will be generated.
 
 The script will also print out any necessary info not included in the textures.
 ## Import textures
