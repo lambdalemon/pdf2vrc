@@ -68,7 +68,7 @@ class FontIndexer:
             self._indexer_map = lambda o: None
         elif by_unicode:
             self._indexer_map = get_unicode2gid(fontfile)
-        elif isinstance(font, PDFType1Font) and not isinstance(font, PDFTrueTypeFont):
+        elif isinstance(font, PDFType1Font):
             self._indexer_map = get_type1_cid2gid(font, fontfile)
         elif isinstance(font, PDFCIDFont) and font.cidcoding == "Adobe-Identity":
             self._indexer_map = lambda o: o.cid
@@ -128,7 +128,7 @@ class GlyphIndexer:
             Path(f"fonts\\{k}.txt").write_text(",".join(map(str, v)))
 
     def unidentified_cids(self):
-        return [(font.fontname, list(indexer.unidentified_cids)) for font, indexer in self.font_indexers.items() 
+        return [(font, list(indexer.unidentified_cids)) for font, indexer in self.font_indexers.items()
                 if indexer.unidentified_cids]
 
 @contextmanager
@@ -356,8 +356,9 @@ if __name__ == "__main__":
         sys.exit("Please acquire missing fonts and try again.")
     if indexer.unidentified_cids():
         print("Failed to identify the following cids:")
-        for fontname, cids in indexer.unidentified_cids():
-            print(f"{fontname}: {cids}")
+        for font, cids in indexer.unidentified_cids():
+            print(f"{font.fontname}: {cids}")
+            print(font.spec)
 
     indexer.write_glyphset_files()
 

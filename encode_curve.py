@@ -50,8 +50,13 @@ def split_bezier(x0, x1, x2):
 
 def to_rgb(c):
     if isinstance(c, Iterable):
-        return c if len(c) == 3 else (1 - np.array(c[:3])) * (1 - c[3])
-    elif isinstance(c, float | int):
+        if len(c) == 3:
+            return c
+        elif len(c) == 4:
+            return (1 - np.array(c[:3])) * (1 - c[3])
+        elif len(c) == 1:
+            c = c[0]
+    if isinstance(c, float | int):
         return (c, c, c)
     else:
         return (0, 0, 0)
@@ -243,7 +248,7 @@ def encode_curve_fill(verts, segments, beziers, rescale, evenodd):
         return None
 
     removed_vs = set()
-    for _ in range(5):
+    for _ in range(3):
         segments.sort(key=lambda s: -norm(verts[s[0]]-verts[s[1]]) if s in beziers else 1)
         for (s, v0), (v1, v2) in product(beziers.items(), segments[len(beziers):]):
             if pt_on_segment(*verts[[v0,v1,v2]]):
